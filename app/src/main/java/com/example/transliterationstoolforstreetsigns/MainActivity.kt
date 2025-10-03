@@ -3,6 +3,7 @@ package com.example.transliterationstoolforstreetsigns
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.icu.text.Transliterator
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -17,11 +18,13 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -65,6 +68,7 @@ import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -124,6 +128,21 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// Helper to map ML Kit language to ICU script for Transliterator
+private fun langToScript(langCode: String): String {
+    return when (langCode) {
+        TranslateLanguage.HINDI -> "Devanagari"
+        TranslateLanguage.KANNADA -> "Kannada"
+        TranslateLanguage.ENGLISH -> "Latin"
+        else -> "Any"
+    }
+}
+
+// Helper to get a displayable name for a language code
+private fun getLanguageDisplayName(langCode: String): String {
+    return Locale.forLanguageTag(langCode).displayName
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CameraWithTransliteration(
@@ -136,6 +155,7 @@ fun CameraWithTransliteration(
     val context = LocalContext.current
 
     var recognizedText by remember { mutableStateOf("No text recognized yet") }
+    var translatedText by remember { mutableStateOf("Translation will appear here") }
     var transliteratedText by remember { mutableStateOf("Transliteration will appear here") }
 
     val availableLanguages = remember {
@@ -170,32 +190,45 @@ fun CameraWithTransliteration(
         val conditions = DownloadConditions.Builder().requireWifi().build()
         translator.downloadModelIfNeeded(conditions)
             .addOnSuccessListener {
-                Log.d("CameraWithTransliteration", "Model for $sourceLang -> $targetLang downloaded.")
-                if (recognizedText != "No text recognized yet" && recognizedText.isNotBlank()) {
-                    translator.translate(recognizedText)
-                        .addOnSuccessListener { transliteratedText = it }
-                        .addOnFailureListener { transliteratedText = "Ready to translate." }
-                } else {
-                    transliteratedText = "Language model ready."
-                }
+                Log.d("CameraWithTransliteration", "Translation model for $sourceLang -> $targetLang downloaded.")
+                translatedText = "Language model ready."
             }
             .addOnFailureListener { e ->
                 Log.e("CameraWithTransliteration", "Model download failed for $sourceLang -> $targetLang.", e)
-                transliteratedText = "Failed to download model for $sourceLang -> $targetLang."
+                translatedText = "Failed to download model."
+            }
+    }
+
+    fun performTranslation(text: String) {
+        if (sourceLang == targetLang) {
+            translatedText = text
+            return
+        }
+        translator.translate(text)
+            .addOnSuccessListener { translated -> translatedText = translated }
+            .addOnFailureListener { e ->
+                Log.e("CameraWithTransliteration", "Translation failed", e)
+                translatedText = "Translation failed."
             }
     }
 
     fun performTransliteration(text: String) {
-        if (sourceLang == targetLang) {
+        val sourceScript = langToScript(sourceLang)
+        val targetScript = langToScript(targetLang)
+
+        if (sourceScript == targetScript) {
             transliteratedText = text
             return
         }
-        translator.translate(text)
-            .addOnSuccessListener { translated -> transliteratedText = translated }
-            .addOnFailureListener { e ->
-                Log.e("CameraWithTransliteration", "Translation failed", e)
-                transliteratedText = "Translation failed."
-            }
+
+        try {
+            val transliteratorId = "$sourceScript-$targetScript"
+            val transliterator = Transliterator.getInstance(transliteratorId)
+            transliteratedText = transliterator.transliterate(text)
+        } catch (e: Exception) {
+            Log.e("CameraWithTransliteration", "Transliteration failed", e)
+            transliteratedText = "Transliteration not supported."
+        }
     }
 
     Box(modifier = modifier.fillMaxSize()) {
@@ -215,13 +248,35 @@ fun CameraWithTransliteration(
                             it.setAnalyzer(cameraExecutor) { imageProxy ->
                                 val mediaImage = imageProxy.image
                                 if (mediaImage != null) {
-                                    val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+                                    val rotation = imageProxy.imageInfo.rotationDegrees
+
+                                    // Define the focus area relative to the image's dimensions
+                                    val imageWidth = if (rotation % 180 == 0) imageProxy.width else imageProxy.height
+                                    val imageHeight = if (rotation % 180 == 0) imageProxy.height else imageProxy.width
+
+                                    val focusBoxTop = imageHeight * 0.35f
+                                    val focusBoxBottom = imageHeight * 0.65f
+                                    val focusBoxLeft = imageWidth * 0.05f
+                                    val focusBoxRight = imageWidth * 0.95f
+
+                                    val image = InputImage.fromMediaImage(mediaImage, rotation)
                                     textRecognizer.process(image)
                                         .addOnSuccessListener { visionText ->
-                                            val fullText = visionText.text
-                                            if (fullText.isNotBlank()) {
-                                                recognizedText = fullText
-                                                performTransliteration(fullText)
+                                            val recognizedTextInFocus = visionText.textBlocks
+                                                .filter { block ->
+                                                    val box = block.boundingBox ?: return@filter false
+                                                    // Check if the center of the text block is within our defined focus area
+                                                    box.exactCenterY() > focusBoxTop && box.exactCenterY() < focusBoxBottom &&
+                                                            box.exactCenterX() > focusBoxLeft && box.exactCenterX() < focusBoxRight
+                                                }
+                                                .joinToString(separator = "\n") { it.text }
+
+                                            if (recognizedTextInFocus.isNotBlank() && recognizedTextInFocus != recognizedText) {
+                                                recognizedText = recognizedTextInFocus
+                                                translatedText = "..."
+                                                transliteratedText = "..."
+                                                performTranslation(recognizedTextInFocus)
+                                                performTransliteration(recognizedTextInFocus)
                                             }
                                             imageProxy.close()
                                         }
@@ -246,24 +301,34 @@ fun CameraWithTransliteration(
             modifier = Modifier.fillMaxSize()
         )
 
+        // Focus area UI overlay
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(0.9f)
+                .fillMaxHeight(0.3f)
+                .align(Alignment.Center)
+                .border(2.dp, Color.White.copy(alpha = 0.7f))
+        )
+
         // UI elements overlaid on top
         Column(modifier = Modifier.fillMaxSize()) {
             // Language selectors at the top
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)) // Semi-transparent background
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f))
                     .padding(8.dp),
                 horizontalArrangement = Arrangement.SpaceAround,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // Source Language Dropdown
                 ExposedDropdownMenuBox(
                     expanded = sourceDropdownExpanded,
                     onExpandedChange = { sourceDropdownExpanded = !sourceDropdownExpanded },
                     modifier = Modifier.weight(1f).padding(end = 4.dp)
                 ) {
                     TextField(
-                        value = sourceLang,
+                        value = getLanguageDisplayName(sourceLang),
                         onValueChange = {},
                         readOnly = true,
                         label = { Text("Source") },
@@ -273,23 +338,25 @@ fun CameraWithTransliteration(
                     ExposedDropdownMenu(expanded = sourceDropdownExpanded, onDismissRequest = { sourceDropdownExpanded = false }) {
                         availableLanguages.forEach { langCode ->
                             DropdownMenuItem(
-                                text = { Text(TranslateLanguage.zza(langCode) ?: langCode) },
+                                text = { Text(getLanguageDisplayName(langCode)) },
                                 onClick = {
                                     sourceLang = langCode
                                     sourceDropdownExpanded = false
+                                    translatedText = "..."
                                     transliteratedText = "..."
                                 }
                             )
                         }
                     }
                 }
+                // Target Language Dropdown
                 ExposedDropdownMenuBox(
                     expanded = targetDropdownExpanded,
                     onExpandedChange = { targetDropdownExpanded = !targetDropdownExpanded },
                     modifier = Modifier.weight(1f).padding(start = 4.dp)
                 ) {
                     TextField(
-                        value = targetLang,
+                        value = getLanguageDisplayName(targetLang),
                         onValueChange = {},
                         readOnly = true,
                         label = { Text("Target") },
@@ -299,10 +366,11 @@ fun CameraWithTransliteration(
                     ExposedDropdownMenu(expanded = targetDropdownExpanded, onDismissRequest = { targetDropdownExpanded = false }) {
                         availableLanguages.forEach { langCode ->
                             DropdownMenuItem(
-                                text = { Text(TranslateLanguage.zza(langCode) ?: langCode) },
+                                text = { Text(getLanguageDisplayName(langCode)) },
                                 onClick = {
                                     targetLang = langCode
                                     targetDropdownExpanded = false
+                                    translatedText = "..."
                                     transliteratedText = "..."
                                 }
                             )
@@ -311,17 +379,14 @@ fun CameraWithTransliteration(
                 }
             }
 
-            Spacer(Modifier.weight(1f)) // Pushes the results card to the bottom
+            Spacer(Modifier.weight(1f))
 
             // Results card at the bottom
             Card(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 Column(modifier = Modifier.padding(16.dp)) {
+                    // 1. Original Text
                     Text("Original:", style = MaterialTheme.typography.titleMedium)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(text = recognizedText, modifier = Modifier.weight(1f))
                         Row {
                             IconButton(onClick = {
@@ -336,20 +401,16 @@ fun CameraWithTransliteration(
                                     putExtra(Intent.EXTRA_TEXT, recognizedText)
                                     type = "text/plain"
                                 }
-                                val shareIntent = Intent.createChooser(sendIntent, null)
-                                context.startActivity(shareIntent)
+                                context.startActivity(Intent.createChooser(sendIntent, null))
                             }) {
                                 Icon(Icons.Filled.Share, contentDescription = "Share Original Text")
                             }
                         }
                     }
 
+                    // 2. Transliterated Text
                     Text("Transliterated:", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(text = transliteratedText, modifier = Modifier.weight(1f))
                         Row {
                             IconButton(onClick = {
@@ -364,10 +425,33 @@ fun CameraWithTransliteration(
                                     putExtra(Intent.EXTRA_TEXT, transliteratedText)
                                     type = "text/plain"
                                 }
-                                val shareIntent = Intent.createChooser(sendIntent, null)
-                                context.startActivity(shareIntent)
+                                context.startActivity(Intent.createChooser(sendIntent, null))
                             }) {
                                 Icon(Icons.Filled.Share, contentDescription = "Share Transliterated Text")
+                            }
+                        }
+                    }
+
+                    // 3. Translated Text
+                    Text("Translated:", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(text = translatedText, modifier = Modifier.weight(1f))
+                        Row {
+                            IconButton(onClick = {
+                                clipboardManager.setText(AnnotatedString(translatedText))
+                                Toast.makeText(context, "Copied!", Toast.LENGTH_SHORT).show()
+                            }) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy Translated Text")
+                            }
+                            IconButton(onClick = {
+                                val sendIntent: Intent = Intent().apply {
+                                    action = Intent.ACTION_SEND
+                                    putExtra(Intent.EXTRA_TEXT, translatedText)
+                                    type = "text/plain"
+                                }
+                                context.startActivity(Intent.createChooser(sendIntent, null))
+                            }) {
+                                Icon(Icons.Filled.Share, contentDescription = "Share Translated Text")
                             }
                         }
                     }
